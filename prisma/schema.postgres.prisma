@@ -1,0 +1,252 @@
+// Production schema — identical to schema.prisma except for the datasource
+// provider. The Dockerfile copies this over schema.prisma before
+// `prisma generate` and `prisma migrate deploy` run.
+//
+// Why a separate file: Prisma's `provider` field cannot be set via env var,
+// so we keep SQLite for local dev (zero-setup) and switch to Postgres for
+// container/production deployments via this file.
+//
+// Keep this in sync with schema.prisma (the rest of the file). To update:
+//   1. Edit schema.prisma (the dev version) for any model changes.
+//   2. Run `npx prisma migrate dev --name your-change` (against SQLite).
+//   3. Copy the model definitions verbatim into this file.
+//   4. Generate Postgres-flavored migrations:
+//        DATABASE_URL=postgresql://... npx prisma migrate dev --schema prisma/schema.postgres.prisma
+//        (or `migrate deploy` against an empty DB)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String   @id @default(cuid())
+  handle           String   @unique
+  email            String?  @unique
+  createdAt        DateTime @default(now())
+  chipsBalance     Float    @default(0)
+  lastBonusAt      DateTime?
+
+  passwordHash     String?
+  role             String   @default("USER")
+
+  googleId         String?  @unique
+
+  pasRating        Float    @default(1500)
+  pasPeak          Float    @default(1500)
+
+  brierSum         Float    @default(0)
+  logScoreSum      Float    @default(0)
+  gradedTrades     Int      @default(0)
+
+  correctTrades    Int      @default(0)
+  streak           Int      @default(0)
+  longestStreak    Int      @default(0)
+  xp               Int      @default(0)
+
+  totalStaked      Float    @default(0)
+  totalPnL         Float    @default(0)
+
+  tier             String   @default("anonymous")
+
+  trades           Trade[]
+  positions        SharePosition[]
+  createdMarkets   Market[]            @relation("MarketOwner")
+  transactions     CoinTransaction[]
+  badges           UserBadge[]
+  sessions         Session[]
+
+  @@index([chipsBalance])
+  @@index([pasRating])
+  @@index([totalPnL])
+  @@index([streak])
+}
+
+model Session {
+  id         String   @id
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  userAgent  String?
+  ipAddress  String?
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Market {
+  id                   Int       @id @default(autoincrement())
+  description          String
+  category             String    @default("Other")
+  imageUrl             String?
+  resolutionSource     String    @default("")
+  createdAt            DateTime  @default(now())
+  endTime              DateTime
+
+  ownerId              String
+  owner                User      @relation("MarketOwner", fields: [ownerId], references: [id])
+
+  liquidityB           Float     @default(500)
+
+  useLsLmsr            Boolean   @default(false)
+  lsAlpha              Float     @default(0.05)
+
+  status               String    @default("LIVE")
+  proposedOutcomeIndex Int?
+  proposedAt           DateTime?
+  disputeUntil         DateTime?
+  resolvedOutcomeIndex Int?
+  resolvedAt           DateTime?
+
+  outcomes             Outcome[]
+  trades               Trade[]
+  positions            SharePosition[]
+  priceSnapshots       PriceSnapshot[]
+
+  @@index([status, endTime])
+  @@index([category, createdAt])
+}
+
+model Outcome {
+  id              Int     @id @default(autoincrement())
+  marketId        Int
+  market          Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  index           Int
+  name            String
+  sharesOutstanding Float @default(0)
+
+  @@unique([marketId, index])
+}
+
+model SharePosition {
+  id              Int      @id @default(autoincrement())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  marketId        Int
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  outcomeIndex    Int
+  shares          Float    @default(0)
+  chipsSpent      Float    @default(0)
+  claimed         Boolean  @default(false)
+
+  @@unique([userId, marketId, outcomeIndex])
+}
+
+model Trade {
+  id              Int      @id @default(autoincrement())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  marketId        Int
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  outcomeIndex    Int
+  side            String
+  shares          Float
+  chipsDelta      Float
+  avgFillPrice    Float
+  createdAt       DateTime @default(now())
+
+  graded          Boolean  @default(false)
+  isCorrect       Boolean?
+  brier           Float?
+  logLoss         Float?
+  pasDelta        Float?
+
+  @@index([marketId, createdAt])
+  @@index([userId, createdAt])
+  @@index([marketId, graded])
+  @@index([userId, graded])
+}
+
+model PriceSnapshot {
+  id        Int      @id @default(autoincrement())
+  marketId  Int
+  market    Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  t         DateTime @default(now())
+  percents  String
+
+  @@index([marketId, t])
+}
+
+model CoinTransaction {
+  id           Int      @id @default(autoincrement())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  type         String
+  amount       Float
+  balanceAfter Float
+  marketId     Int?
+  tradeId      Int?
+  note         String?
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Badge {
+  id            Int         @id @default(autoincrement())
+  slug          String      @unique
+  name          String
+  description   String
+  conditionType String
+  threshold     Float?
+  iconName      String?
+
+  awards        UserBadge[]
+}
+
+model UserBadge {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  badgeId   Int
+  badge     Badge    @relation(fields: [badgeId], references: [id])
+  earnedAt  DateTime @default(now())
+
+  @@id([userId, badgeId])
+}
+
+model NewsItem {
+  id           Int            @id @default(autoincrement())
+  url          String         @unique
+  title        String
+  summary      String?
+  source       String
+  publishedAt  DateTime?
+  fetchedAt    DateTime       @default(now())
+  drafted      Boolean        @default(false)
+
+  drafts       MarketDraft[]
+
+  @@index([fetchedAt])
+}
+
+model MarketDraft {
+  id                Int       @id @default(autoincrement())
+  description       String
+  category          String    @default("Other")
+  outcomes          String
+  endTime           DateTime
+  resolutionSource  String    @default("")
+  liquidityB        Float     @default(500)
+  useLsLmsr         Boolean   @default(false)
+  lsAlpha           Float     @default(0.05)
+
+  status            String    @default("PENDING")
+  rationale         String?
+  confidence        Float?
+
+  newsItemId        Int?
+  newsItem          NewsItem? @relation(fields: [newsItemId], references: [id], onDelete: SetNull)
+
+  createdAt         DateTime  @default(now())
+  reviewedAt        DateTime?
+  reviewedByHandle  String?
+  approvedMarketId  Int?
+
+  @@index([status, createdAt])
+}

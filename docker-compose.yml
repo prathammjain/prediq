@@ -1,0 +1,60 @@
+# predIQ — local production-like stack: API + Postgres.
+#
+# Usage:
+#   docker compose up --build      # first run, builds image
+#   docker compose up -d           # detached
+#   docker compose logs -f web     # tail logs
+#   docker compose down -v         # tear down + drop the data volume
+#
+# The web service reads MISTRAL_API_KEY (for the news pipeline) from your
+# host's .env file via env_file. NEWS_INGEST_INTERVAL_MIN is opt-in here
+# because most local-prod tests don't want the cron firing real Mistral
+# requests.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: prediq
+      POSTGRES_PASSWORD: prediq_dev
+      POSTGRES_DB: prediq
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Wait for Postgres to accept connections before web starts.
+      test: ["CMD-SHELL", "pg_isready -U prediq -d prediq"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    # Don't expose Postgres on the host by default — only the web service
+    # needs it. Uncomment if you want to inspect with psql from your host.
+    # ports:
+    #   - "5432:5432"
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://prediq:prediq_dev@postgres:5432/prediq?schema=public
+      DEMO_PASSWORD: demo1234
+      # Set this in your host shell (export MISTRAL_API_KEY=…) or in .env;
+      # docker-compose forwards both. Leave unset to disable the news
+      # pipeline cleanly.
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      # NEWS_INGEST_INTERVAL_MIN: 360
+    env_file:
+      # Optional — only used if .env exists. Useful for keeping
+      # MISTRAL_API_KEY out of compose.yml.
+      - path: .env
+        required: false
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres-data:

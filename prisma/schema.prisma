@@ -1,0 +1,286 @@
+// predIQ — Prisma schema.
+// SQLite is used for zero-dep local dev. Swap `provider = "postgresql"` + new `url`
+// to move to Postgres without changing any query code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String   @id @default(cuid())
+  handle           String   @unique
+  email            String?  @unique
+  createdAt        DateTime @default(now())
+  chipsBalance     Float    @default(0)
+  lastBonusAt      DateTime?
+
+  // --- Auth ---------------------------------------------------------------
+  // bcrypt hash. Nullable so OAuth-only and demo accounts can exist without
+  // a password set yet (set on first login or via admin tooling).
+  passwordHash     String?
+  // ADMIN role replaces the previous handle === 'admin' string check.
+  role             String   @default("USER")  // USER | ADMIN
+
+  // Google OAuth subject id. Set when a user signs in with Google. Unique so
+  // a Google account can only be linked to one predIQ user.
+  googleId         String?  @unique
+
+  // --- Skill & scoring ----------------------------------------------------
+  // PAS = Prediction Accuracy Score. Elo-style rating updated via the
+  // Brier Skill Score of each graded trade. Starts at 1500.
+  pasRating        Float    @default(1500)
+  pasPeak          Float    @default(1500)
+
+  // Cumulative proper-scoring-rule losses (lower = better forecaster).
+  brierSum         Float    @default(0)   // sum of (outcome - p)^2
+  logScoreSum      Float    @default(0)   // sum of -ln(p_assigned_to_truth)
+  gradedTrades     Int      @default(0)   // denominator for the means above
+
+  // Engagement / accuracy headline counters.
+  correctTrades    Int      @default(0)
+  streak           Int      @default(0)
+  longestStreak    Int      @default(0)
+  xp               Int      @default(0)
+
+  // Lifetime economics.
+  totalStaked      Float    @default(0)
+  totalPnL         Float    @default(0)   // realized payout - chips spent
+
+  // First successful BUY trade — used by the UI to gate the new-user
+  // welcome card and the first-trade explainer in BuyModal. Stays null
+  // forever for accounts that never trade.
+  firstTradeAt     DateTime?
+
+  // Verification tier (anonymous / verified / notable).
+  tier             String   @default("anonymous")   // anonymous | verified | notable
+
+  trades           Trade[]
+  positions        SharePosition[]
+  createdMarkets   Market[]            @relation("MarketOwner")
+  transactions     CoinTransaction[]
+  badges           UserBadge[]
+  sessions         Session[]
+
+  // Leaderboard sort indexes — covers ?by=balance|pas|pnl|streak.
+  @@index([chipsBalance])
+  @@index([pasRating])
+  @@index([totalPnL])
+  @@index([streak])
+}
+
+// Server-side session. The `id` is the opaque cookie value (cryptographically
+// random). Logout = delete the row. Renewing slides the expiry forward.
+model Session {
+  id         String   @id
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  userAgent  String?
+  ipAddress  String?
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// A prediction market with N outcomes.
+model Market {
+  id                   Int       @id @default(autoincrement())
+  description          String
+  category             String    @default("Other")
+  imageUrl             String?
+  resolutionSource     String    @default("")
+  createdAt            DateTime  @default(now())
+  endTime              DateTime
+
+  ownerId              String
+  owner                User      @relation("MarketOwner", fields: [ownerId], references: [id])
+
+  // LMSR liquidity parameter (higher = more liquid, higher max subsidy).
+  // For LS-LMSR markets this is the *initial* b₀; the actual b is α·Σq
+  // and grows as shares are bought.
+  liquidityB           Float     @default(500)
+
+  // If true, this market uses Liquidity-Sensitive LMSR (Othman et al. 2010):
+  // b(q) = lsAlpha · Σqᵢ. Each outcome is seeded so initial b == liquidityB.
+  // Default false → existing markets keep classic-LMSR behaviour.
+  useLsLmsr            Boolean   @default(false)
+  lsAlpha              Float     @default(0.05)
+
+  // Lifecycle
+  status               String    @default("LIVE")   // LIVE | CLOSED | PROPOSED | DISPUTED | RESOLVED
+  proposedOutcomeIndex Int?
+  proposedAt           DateTime?
+  disputeUntil         DateTime?
+  resolvedOutcomeIndex Int?
+  resolvedAt           DateTime?
+
+  outcomes             Outcome[]
+  trades               Trade[]
+  positions            SharePosition[]
+  priceSnapshots       PriceSnapshot[]
+
+  // Hot read paths: list-by-category, list-by-status, scheduled-close jobs.
+  @@index([status, endTime])
+  @@index([category, createdAt])
+}
+
+model Outcome {
+  id              Int     @id @default(autoincrement())
+  marketId        Int
+  market          Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  index           Int
+  name            String
+  // LMSR: cumulative shares outstanding for this outcome.
+  sharesOutstanding Float @default(0)
+
+  @@unique([marketId, index])
+}
+
+// A user's share position for a single (market, outcome).
+model SharePosition {
+  id              Int      @id @default(autoincrement())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  marketId        Int
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  outcomeIndex    Int
+  shares          Float    @default(0)     // share balance (may be fractional)
+  chipsSpent      Float    @default(0)     // cumulative net chips spent (avg cost basis tracking)
+  claimed         Boolean  @default(false)
+
+  @@unique([userId, marketId, outcomeIndex])
+}
+
+// Append-only trade ledger. Records every LMSR buy (and future sell).
+model Trade {
+  id           Int      @id @default(autoincrement())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  marketId     Int
+  market       Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  outcomeIndex Int
+  side         String   // BUY | SELL
+  shares       Float
+  chipsDelta   Float    // chips paid (BUY = positive) or received (SELL = negative payment, i.e. user gets chips back)
+  avgFillPrice Float    // chipsDelta / shares — the trade's implied probability for `outcomeIndex`
+  createdAt    DateTime @default(now())
+
+  // --- Grading (filled exactly once when the parent market resolves) -----
+  // We record per-trade Brier and log losses so PAS / calibration are
+  // fully reproducible from the trade ledger.
+  graded       Boolean  @default(false)
+  isCorrect    Boolean?
+  brierLoss    Float?   // (outcome - avgFillPrice)^2
+  logLoss      Float?   // -ln(p_assigned_to_truth), clamped
+  pasDelta     Float?   // contribution to user's PAS rating
+  numOutcomes  Int?     // snapshot of N for baseline math
+
+  // gradeAllTrades scans (marketId, graded=false); calibration scans (userId, graded=true).
+  @@index([marketId, graded])
+  @@index([userId, graded])
+  @@index([userId, createdAt])
+}
+
+// Optional: precomputed probability-over-time series for charts.
+// We write one row on every trade.
+model PriceSnapshot {
+  id         Int      @id @default(autoincrement())
+  marketId   Int
+  market     Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  t          DateTime @default(now())
+  percents   String   // JSON-encoded number[] (SQLite has no array type)
+
+  @@index([marketId, t])
+}
+
+// Append-only ledger of every chip movement. Reconstructable balance =
+// SUM(amount) for a user. Provides legal/audit trail and powers analytics.
+model CoinTransaction {
+  id           Int      @id @default(autoincrement())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  type         String   // SIGNUP_BONUS | DAILY_BONUS | TRADE_BUY | TRADE_PAYOUT | LEAGUE_REWARD | REFUND | ADJUSTMENT
+  amount       Float    // signed: positive = credit, negative = debit
+  balanceAfter Float
+  marketId     Int?
+  tradeId      Int?
+  note         String?
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Badge {
+  id            Int         @id @default(autoincrement())
+  slug          String      @unique
+  name          String
+  description   String
+  conditionType String      // STREAK | ACCURACY | VOLUME | PAS | CALIBRATION | SPECIAL
+  threshold     Float?
+  iconName      String?
+
+  awards        UserBadge[]
+}
+
+model UserBadge {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  badgeId   Int
+  badge     Badge    @relation(fields: [badgeId], references: [id])
+  earnedAt  DateTime @default(now())
+
+  @@id([userId, badgeId])
+}
+
+// A news article ingested from an RSS feed. Deduplicated on URL.
+// Used as the seed for AI-generated MarketDraft proposals.
+model NewsItem {
+  id           Int            @id @default(autoincrement())
+  url          String         @unique
+  title        String
+  summary      String?
+  source       String         // human-readable feed name (e.g. "BBC India")
+  publishedAt  DateTime?
+  fetchedAt    DateTime       @default(now())
+  // Whether we've run the draft-generator on this item yet.
+  drafted      Boolean        @default(false)
+
+  drafts       MarketDraft[]
+
+  @@index([fetchedAt])
+}
+
+// A proposed market awaiting admin review. Approving creates a real Market.
+// `outcomes` is a JSON-encoded string[] (SQLite has no native list type).
+model MarketDraft {
+  id                Int       @id @default(autoincrement())
+  description       String
+  category          String    @default("Other")
+  outcomes          String    // JSON array of strings
+  endTime           DateTime
+  resolutionSource  String    @default("")
+  liquidityB        Float     @default(500)
+  useLsLmsr         Boolean   @default(false)
+  lsAlpha           Float     @default(0.05)
+
+  status            String    @default("PENDING")   // PENDING | APPROVED | REJECTED
+  rationale         String?                          // Claude's reasoning, for admin review
+  confidence        Float?                           // 0..1, generator's confidence
+
+  newsItemId        Int?
+  newsItem          NewsItem? @relation(fields: [newsItemId], references: [id], onDelete: SetNull)
+
+  createdAt         DateTime  @default(now())
+  reviewedAt        DateTime?
+  reviewedByHandle  String?                          // who approved/rejected
+  approvedMarketId  Int?                             // Market.id, set on approve
+
+  @@index([status, createdAt])
+}

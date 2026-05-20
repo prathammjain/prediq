@@ -1,0 +1,41 @@
+# Keep the build context small + reproducible. Anything we don't need
+# inside the image goes here.
+
+# Local install caches (re-fetched in the build via npm ci)
+node_modules
+frontend-vite/node_modules
+
+# Local SQLite database — production uses Postgres
+prisma/dev.db
+prisma/dev.db-journal
+prisma/migrations/dev.db
+
+# Local env files — secrets are injected at runtime via --env-file or
+# orchestrator-supplied env vars (Render, Fly, Railway, K8s, etc.)
+.env
+.env.*
+!.env.example
+
+# Build outputs that we regenerate inside the image
+frontend-vite/dist
+
+# Editor / OS noise
+.DS_Store
+.vscode
+.idea
+*.log
+npm-debug.log*
+
+# Repo metadata
+.git
+.gitignore
+.github
+
+# Tests aren't shipped to production
+tests
+jest.config.js
+
+# Misc
+README.md
+PredIQ_Whitepaper.docx
+.claude
